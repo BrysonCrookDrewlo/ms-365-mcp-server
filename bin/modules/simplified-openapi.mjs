@@ -173,6 +173,34 @@ function normalizeSchemaRefs(openApiSpec) {
     }
   };
 
+  const processParameter = (parameter, contextName) => {
+    if (!parameter || typeof parameter !== 'object') {
+      return;
+    }
+
+    const parameterName = typeof parameter.name === 'string' ? parameter.name : '';
+    let derivedContext = contextName || '';
+    if (parameterName) {
+      derivedContext = derivedContext ? `${derivedContext} ${parameterName}` : parameterName;
+    }
+    if (!derivedContext) {
+      derivedContext = 'Parameter';
+    }
+
+    if (parameter.schema && typeof parameter.schema === 'object') {
+      processSchema(parameter.schema, derivedContext);
+    }
+
+    if (parameter.content && typeof parameter.content === 'object') {
+      Object.entries(parameter.content).forEach(([mediaType, content]) => {
+        if (content?.schema) {
+          const mediaContext = mediaType ? `${derivedContext} ${mediaType}` : derivedContext;
+          processSchema(content.schema, mediaContext);
+        }
+      });
+    }
+  };
+
   const hoistRef = (schemaNode, contextName) => {
     const ref = schemaNode.$ref;
     if (!shouldHoistRef(ref)) {
@@ -227,9 +255,19 @@ function normalizeSchemaRefs(openApiSpec) {
     processSchema(schema, schemaName);
   });
 
+  Object.entries(openApiSpec.components?.parameters || {}).forEach(([parameterName, parameter]) => {
+    processParameter(parameter, `ComponentParameter ${parameterName}`);
+  });
+
   Object.entries(openApiSpec.paths || {}).forEach(([pathKey, pathItem]) => {
     if (!pathItem || typeof pathItem !== 'object') {
       return;
+    }
+
+    if (Array.isArray(pathItem.parameters)) {
+      pathItem.parameters.forEach((parameter) => {
+        processParameter(parameter, `Path ${pathKey}`);
+      });
     }
 
     Object.entries(pathItem).forEach(([method, operation]) => {
@@ -239,6 +277,12 @@ function normalizeSchemaRefs(openApiSpec) {
       }
 
       const contextName = operation.operationId || `${normalizedMethod.toUpperCase()} ${pathKey}`;
+
+      if (Array.isArray(operation.parameters)) {
+        operation.parameters.forEach((parameter) => {
+          processParameter(parameter, `${contextName} parameter`);
+        });
+      }
 
       if (operation.requestBody?.content) {
         Object.values(operation.requestBody.content).forEach((content) => {
