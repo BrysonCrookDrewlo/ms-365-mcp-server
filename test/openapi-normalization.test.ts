@@ -119,6 +119,153 @@ describe('OpenAPI normalization', () => {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  it('normalizes parameter schemas referencing nested component properties', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'openapi-parameter-normalization-'));
+
+    try {
+      const endpointsFile = path.join(tempDir, 'endpoints.json');
+      const openapiFile = path.join(tempDir, 'openapi.yaml');
+      const trimmedFile = path.join(tempDir, 'openapi-trimmed.yaml');
+
+      const endpoints = [
+        {
+          pathPattern: '/test',
+          method: 'get',
+          toolName: 'getTestParameters',
+        },
+      ];
+
+      fs.writeFileSync(endpointsFile, JSON.stringify(endpoints, null, 2));
+
+      const spec = {
+        openapi: '3.0.0',
+        info: { title: 'Test API', version: '1.0.0' },
+        paths: {
+          '/test': {
+            parameters: [
+              {
+                name: 'pathParam',
+                in: 'query',
+                required: false,
+                schema: {
+                  $ref: '#/components/schemas/Foo/properties/bar',
+                },
+              },
+            ],
+            get: {
+              summary: 'Test operation',
+              parameters: [
+                {
+                  name: 'queryParam',
+                  in: 'query',
+                  schema: {
+                    $ref: '#/components/schemas/Foo/properties/baz',
+                  },
+                },
+                {
+                  name: 'jsonParam',
+                  in: 'header',
+                  content: {
+                    'application/json': {
+                      schema: {
+                        $ref: '#/components/schemas/Foo/properties/bar',
+                      },
+                    },
+                  },
+                },
+                { $ref: '#/components/parameters/FooBarParam' },
+                { $ref: '#/components/parameters/FooBazContentParam' },
+              ],
+              responses: {
+                '200': {
+                  description: 'OK',
+                },
+              },
+            },
+          },
+        },
+        components: {
+          schemas: {
+            Foo: {
+              type: 'object',
+              properties: {
+                bar: { type: 'string', description: 'Bar value' },
+                baz: { type: 'integer', format: 'int32' },
+              },
+            },
+          },
+          parameters: {
+            FooBarParam: {
+              name: 'headerParam',
+              in: 'header',
+              schema: {
+                $ref: '#/components/schemas/Foo/properties/bar',
+              },
+            },
+            FooBazContentParam: {
+              name: 'jsonHeaderParam',
+              in: 'header',
+              content: {
+                'application/json': {
+                  schema: {
+                    $ref: '#/components/schemas/Foo/properties/baz',
+                  },
+                },
+              },
+            },
+          },
+        },
+      };
+
+      fs.writeFileSync(openapiFile, yaml.dump(spec));
+
+      createAndSaveSimplifiedOpenAPI(endpointsFile, openapiFile, trimmedFile);
+
+      const trimmedContent = fs.readFileSync(trimmedFile, 'utf8');
+      const trimmedSpec = yaml.load(trimmedContent);
+
+      const expectNormalizedRef = (ref) => {
+        expect(ref).toBeDefined();
+        expect(typeof ref).toBe('string');
+        expect(ref.startsWith('#/components/schemas/')).toBe(true);
+        const schemaName = ref.replace('#/components/schemas/', '');
+        expect(schemaName).not.toContain('/');
+        const schema = trimmedSpec.components?.schemas?.[schemaName];
+        expect(schema).toBeDefined();
+        return { schemaName, schema };
+      };
+
+      const fooBarParam = trimmedSpec.components?.parameters?.FooBarParam;
+      expect(fooBarParam).toBeDefined();
+      const barRef = fooBarParam?.schema?.$ref;
+      const { schema: barSchema } = expectNormalizedRef(barRef);
+      expect(barSchema).toMatchObject({ type: 'string', description: 'Bar value' });
+
+      const fooBazContentParam = trimmedSpec.components?.parameters?.FooBazContentParam;
+      expect(fooBazContentParam).toBeDefined();
+      const bazContentRef =
+        fooBazContentParam?.content?.['application/json']?.schema?.$ref;
+      const { schema: bazContentSchema } = expectNormalizedRef(bazContentRef);
+      expect(bazContentSchema).toMatchObject({ type: 'integer', format: 'int32' });
+
+      const getOperation = trimmedSpec.paths?.['/test']?.get;
+      expect(getOperation).toBeDefined();
+
+      const queryParam = getOperation?.parameters?.find((param) => param?.name === 'queryParam');
+      expect(queryParam).toBeDefined();
+      const queryParamRef = queryParam?.schema?.$ref;
+      const { schema: querySchema } = expectNormalizedRef(queryParamRef);
+      expect(querySchema).toMatchObject({ type: 'integer', format: 'int32' });
+
+      const jsonParam = getOperation?.parameters?.find((param) => param?.name === 'jsonParam');
+      expect(jsonParam).toBeDefined();
+      const jsonParamRef = jsonParam?.content?.['application/json']?.schema?.$ref;
+      expectNormalizedRef(jsonParamRef);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 });
 
 function collectRefs(node, refs) {
