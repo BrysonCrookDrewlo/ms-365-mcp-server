@@ -55,11 +55,423 @@ export function createAndSaveSimplifiedOpenAPI(endpointsFile, openapiFile, opena
     simplifyAnyOfInPaths(openApiSpec.paths);
   }
 
+  console.log('✨ Normalizing inline schema references...');
+  normalizeSchemaRefs(openApiSpec);
+
   console.log('🧹 Pruning unused schemas...');
   const usedSchemas = findUsedSchemas(openApiSpec);
   pruneUnusedSchemas(openApiSpec, usedSchemas);
 
   fs.writeFileSync(openapiTrimmedFile, yaml.dump(openApiSpec));
+}
+
+function normalizeSchemaRefs(openApiSpec) {
+  if (!openApiSpec || typeof openApiSpec !== 'object') {
+    return;
+  }
+
+  openApiSpec.components = openApiSpec.components || {};
+  openApiSpec.components.schemas = openApiSpec.components.schemas || {};
+
+  const pointerToComponent = new Map();
+  const existingNames = new Set(Object.keys(openApiSpec.components.schemas));
+  const visitedSchemas = new WeakSet();
+  let hoistedCount = 0;
+
+  const httpMethods = new Set(['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace']);
+
+  const processSchema = (schema, contextName) => {
+    if (!schema || typeof schema !== 'object' || visitedSchemas.has(schema)) {
+      return;
+    }
+
+    visitedSchemas.add(schema);
+
+    if (typeof schema.$ref === 'string') {
+      const normalizedRef = hoistRef(schema, contextName);
+      if (normalizedRef) {
+        schema.$ref = normalizedRef;
+      }
+    }
+
+    if (Array.isArray(schema.allOf)) {
+      schema.allOf.forEach((subSchema) => processSchema(subSchema, contextName));
+    }
+    if (Array.isArray(schema.anyOf)) {
+      schema.anyOf.forEach((subSchema) => processSchema(subSchema, contextName));
+    }
+    if (Array.isArray(schema.oneOf)) {
+      schema.oneOf.forEach((subSchema) => processSchema(subSchema, contextName));
+    }
+    if (Array.isArray(schema.prefixItems)) {
+      schema.prefixItems.forEach((subSchema) => processSchema(subSchema, contextName));
+    }
+
+    if (schema.not) {
+      processSchema(schema.not, contextName);
+    }
+    if (schema.contains) {
+      processSchema(schema.contains, contextName);
+    }
+    if (schema.propertyNames) {
+      processSchema(schema.propertyNames, contextName);
+    }
+    if (schema.if) {
+      processSchema(schema.if, contextName);
+    }
+    if (schema.then) {
+      processSchema(schema.then, contextName);
+    }
+    if (schema.else) {
+      processSchema(schema.else, contextName);
+    }
+
+    if (schema.items) {
+      if (Array.isArray(schema.items)) {
+        schema.items.forEach((item) => processSchema(item, contextName));
+      } else {
+        processSchema(schema.items, contextName);
+      }
+    }
+
+    if (schema.additionalProperties && typeof schema.additionalProperties === 'object') {
+      processSchema(schema.additionalProperties, contextName);
+    }
+
+    if (schema.additionalItems && typeof schema.additionalItems === 'object') {
+      processSchema(schema.additionalItems, contextName);
+    }
+
+    if (schema.unevaluatedItems && typeof schema.unevaluatedItems === 'object') {
+      processSchema(schema.unevaluatedItems, contextName);
+    }
+
+    if (schema.unevaluatedProperties && typeof schema.unevaluatedProperties === 'object') {
+      processSchema(schema.unevaluatedProperties, contextName);
+    }
+
+    if (schema.patternProperties && typeof schema.patternProperties === 'object') {
+      Object.values(schema.patternProperties).forEach((propSchema) =>
+        processSchema(propSchema, contextName)
+      );
+    }
+
+    if (schema.dependencies && typeof schema.dependencies === 'object') {
+      Object.values(schema.dependencies).forEach((dep) => {
+        if (dep && typeof dep === 'object') {
+          processSchema(dep, contextName);
+        }
+      });
+    }
+
+    if (schema.dependentSchemas && typeof schema.dependentSchemas === 'object') {
+      Object.values(schema.dependentSchemas).forEach((dep) => processSchema(dep, contextName));
+    }
+
+    if (schema.properties && typeof schema.properties === 'object') {
+      Object.values(schema.properties).forEach((propSchema) => processSchema(propSchema, contextName));
+    }
+  };
+
+  const hoistRef = (schemaNode, contextName) => {
+    const ref = schemaNode.$ref;
+    if (!shouldHoistRef(ref)) {
+      return null;
+    }
+
+    if (pointerToComponent.has(ref)) {
+      const componentName = pointerToComponent.get(ref);
+      return `#/components/schemas/${componentName}`;
+    }
+
+    const resolved = resolveJsonPointerWithParent(openApiSpec, ref);
+    if (!resolved) {
+      return null;
+    }
+
+    const { parent, key, value } = resolved;
+    if (!value || typeof value !== 'object') {
+      return null;
+    }
+
+    if (value.$ref && typeof value.$ref === 'string') {
+      if (!shouldHoistRef(value.$ref) && value.$ref.startsWith('#/components/schemas/')) {
+        const existingName = value.$ref.replace('#/components/schemas/', '');
+        pointerToComponent.set(ref, existingName);
+        return value.$ref;
+      }
+    }
+
+    const clonedSchema = cloneSchema(value);
+
+    let derivedContext = contextName;
+    if (!derivedContext && ref.startsWith('#/components/schemas/')) {
+      const remainder = ref.slice('#/components/schemas/'.length);
+      derivedContext = remainder.split('/')[0];
+    }
+
+    const componentName = generateComponentName(derivedContext, ref, existingNames);
+    pointerToComponent.set(ref, componentName);
+    openApiSpec.components.schemas[componentName] = clonedSchema;
+    hoistedCount += 1;
+
+    const replacementRef = `#/components/schemas/${componentName}`;
+    parent[key] = { $ref: replacementRef };
+
+    processSchema(clonedSchema, componentName);
+
+    return replacementRef;
+  };
+
+  Object.entries(openApiSpec.components.schemas).forEach(([schemaName, schema]) => {
+    processSchema(schema, schemaName);
+  });
+
+  Object.entries(openApiSpec.paths || {}).forEach(([pathKey, pathItem]) => {
+    if (!pathItem || typeof pathItem !== 'object') {
+      return;
+    }
+
+    Object.entries(pathItem).forEach(([method, operation]) => {
+      const normalizedMethod = typeof method === 'string' ? method.toLowerCase() : method;
+      if (!httpMethods.has(normalizedMethod) || !operation || typeof operation !== 'object') {
+        return;
+      }
+
+      const contextName = operation.operationId || `${normalizedMethod.toUpperCase()} ${pathKey}`;
+
+      if (operation.requestBody?.content) {
+        Object.values(operation.requestBody.content).forEach((content) => {
+          if (content?.schema) {
+            processSchema(content.schema, contextName);
+          }
+        });
+      }
+
+      if (operation.responses) {
+        Object.values(operation.responses).forEach((response) => {
+          if (!response || typeof response !== 'object') {
+            return;
+          }
+
+          if (response.content) {
+            Object.values(response.content).forEach((content) => {
+              if (content?.schema) {
+                processSchema(content.schema, contextName);
+              }
+            });
+          }
+        });
+      }
+    });
+  });
+
+  Object.values(openApiSpec.components?.responses || {}).forEach((response) => {
+    if (!response || typeof response !== 'object' || !response.content) {
+      return;
+    }
+
+    Object.values(response.content).forEach((content) => {
+      if (content?.schema) {
+        processSchema(content.schema, 'ComponentResponse');
+      }
+    });
+  });
+
+  Object.values(openApiSpec.components?.requestBodies || {}).forEach((requestBody) => {
+    if (!requestBody || typeof requestBody !== 'object' || !requestBody.content) {
+      return;
+    }
+
+    Object.values(requestBody.content).forEach((content) => {
+      if (content?.schema) {
+        processSchema(content.schema, 'ComponentRequestBody');
+      }
+    });
+  });
+
+  if (hoistedCount > 0) {
+    console.log(`   Hoisted ${hoistedCount} inline schema${hoistedCount === 1 ? '' : 's'} into components`);
+  } else {
+    console.log('   No inline schema references required hoisting');
+  }
+}
+
+function shouldHoistRef(ref) {
+  if (typeof ref !== 'string' || !ref.startsWith('#/')) {
+    return false;
+  }
+
+  if (ref.startsWith('#/$defs/')) {
+    return false;
+  }
+
+  if (ref.startsWith('#/components/schemas/')) {
+    const remainder = ref.slice('#/components/schemas/'.length);
+    return remainder.includes('/');
+  }
+
+  if (ref.startsWith('#/components/')) {
+    return false;
+  }
+
+  return true;
+}
+
+function resolveJsonPointerWithParent(root, pointer) {
+  if (typeof pointer !== 'string' || !pointer.startsWith('#/')) {
+    return null;
+  }
+
+  const segments = pointer
+    .slice(2)
+    .split('/')
+    .map(decodePointerSegment);
+
+  let current = root;
+  let parent = null;
+  let key = null;
+
+  for (const segment of segments) {
+    if (current === undefined || current === null) {
+      return null;
+    }
+
+    parent = current;
+    key = segment;
+    current = current[segment];
+  }
+
+  if (!parent || typeof parent !== 'object') {
+    return null;
+  }
+
+  return { parent, key, value: current };
+}
+
+function generateComponentName(contextName, pointer, existingNames) {
+  const contextSegment = toPascalCase(contextName || '');
+  const pointerSegments = extractPointerNameSegments(pointer, contextSegment);
+
+  const segments = [...pointerSegments];
+  let base = contextSegment;
+
+  if (!base) {
+    base = segments.shift() || 'Hoisted';
+  }
+
+  const suffix = segments.join('');
+  let candidate = suffix ? `${base}${suffix}` : base;
+
+  if (!candidate) {
+    candidate = 'HoistedComponent';
+  }
+
+  let uniqueCandidate = candidate;
+  let counter = 1;
+  while (existingNames.has(uniqueCandidate)) {
+    counter += 1;
+    uniqueCandidate = `${candidate}${counter}`;
+  }
+
+  existingNames.add(uniqueCandidate);
+  return uniqueCandidate;
+}
+
+function extractPointerNameSegments(pointer, contextSegment) {
+  if (typeof pointer !== 'string' || !pointer.startsWith('#/')) {
+    return [];
+  }
+
+  const rawSegments = pointer
+    .slice(2)
+    .split('/')
+    .map(decodePointerSegment)
+    .filter((segment) => segment !== '');
+
+  if (rawSegments.length === 0) {
+    return [];
+  }
+
+  let relevantSegments = rawSegments;
+
+  if (relevantSegments[0] === 'components' && relevantSegments[1] === 'schemas') {
+    relevantSegments = relevantSegments.slice(2);
+  } else if (relevantSegments[0] === '$defs') {
+    relevantSegments = relevantSegments.slice(1);
+  } else if (relevantSegments[0] === 'paths') {
+    const schemaIndex = relevantSegments.lastIndexOf('schema');
+    if (schemaIndex !== -1) {
+      relevantSegments = relevantSegments.slice(schemaIndex + 1);
+    } else {
+      relevantSegments = relevantSegments.slice(-2);
+    }
+  }
+
+  if (relevantSegments[0] === 'properties') {
+    relevantSegments = relevantSegments.slice(1);
+  }
+
+  const structuralSegments = new Set([
+    'components',
+    'schemas',
+    '$defs',
+    'schema',
+    'content',
+    'responses',
+    'requestBody',
+    'properties',
+    'definitions',
+    'pathItems',
+    'allOf',
+    'anyOf',
+    'oneOf',
+    'then',
+    'else',
+    'if',
+  ]);
+
+  const sanitizedSegments = relevantSegments.filter((segment) => !structuralSegments.has(segment));
+
+  const pascalSegments = sanitizedSegments.map((segment) => toPascalCase(segment)).filter(Boolean);
+
+  if (pascalSegments.length && contextSegment && pascalSegments[0] === contextSegment) {
+    pascalSegments.shift();
+  }
+
+  if (!pascalSegments.length) {
+    pascalSegments.push('Component');
+  }
+
+  return pascalSegments;
+}
+
+function decodePointerSegment(segment) {
+  return segment.replace(/~1/g, '/').replace(/~0/g, '~');
+}
+
+function toPascalCase(value) {
+  if (!value) {
+    return '';
+  }
+
+  const cleaned = `${value}`
+    .replace(/([a-z\d])([A-Z])/g, '$1 $2')
+    .replace(/[^a-zA-Z\d]+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1));
+
+  return cleaned.join('');
+}
+
+function cloneSchema(schema) {
+  if (typeof globalThis.structuredClone === 'function') {
+    return globalThis.structuredClone(schema);
+  }
+
+  return JSON.parse(JSON.stringify(schema));
 }
 
 function removeODataTypeRecursively(obj) {
