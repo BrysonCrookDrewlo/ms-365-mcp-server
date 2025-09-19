@@ -89,6 +89,11 @@ describe('OpenAPI normalization', () => {
       const allRefs = new Set();
       collectRefs(trimmedSpec, allRefs);
 
+      const trimmedSchemas = trimmedSpec.components?.schemas || {};
+      expect(Object.keys(trimmedSchemas)).toEqual(
+        expect.arrayContaining(['TestResponse', 'TestResponseSharedThing', 'GetTestTestResponseNested'])
+      );
+
       const propertyRefs = [...allRefs].filter(
         (ref) => typeof ref === 'string' && ref.startsWith('#/properties/')
       );
@@ -102,6 +107,14 @@ describe('OpenAPI normalization', () => {
         return remainder.includes('/');
       });
       expect(nestedComponentRefs).toHaveLength(0);
+
+      const schemaRefs = [...allRefs].filter(
+        (ref) => typeof ref === 'string' && ref.startsWith('#/components/schemas/')
+      );
+      schemaRefs.forEach((ref) => {
+        const schemaName = ref.replace('#/components/schemas/', '');
+        expect(trimmedSchemas[schemaName]).toBeDefined();
+      });
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }

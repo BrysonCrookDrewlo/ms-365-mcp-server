@@ -790,75 +790,119 @@ function findUsedSchemas(openApiSpec) {
   const schemasToProcess = [];
   const schemas = openApiSpec.components?.schemas || {};
   const responses = openApiSpec.components?.responses || {};
+  const requestBodies = openApiSpec.components?.requestBodies || {};
+  const parameters = openApiSpec.components?.parameters || {};
   const paths = openApiSpec.paths || {};
 
-  Object.entries(paths).forEach(([, pathItem]) => {
-    Object.entries(pathItem).forEach(([, operation]) => {
+  const enqueueSchemaRef = (ref) => {
+    if (typeof ref !== 'string' || !ref.startsWith('#/components/schemas/')) {
+      return;
+    }
+    const schemaName = ref.replace('#/components/schemas/', '');
+    if (schemaName) {
+      schemasToProcess.push(schemaName);
+    }
+  };
+
+  const processSchemaRefs = (schema) => {
+    if (!schema || typeof schema !== 'object') return;
+    findRefsInObject(schema, enqueueSchemaRef);
+  };
+
+  const visitedResponses = new Set();
+  const processResponse = (response) => {
+    if (!response || typeof response !== 'object') return;
+
+    if (response.$ref) {
+      const responseName = response.$ref.replace('#/components/responses/', '');
+      if (!visitedResponses.has(responseName) && responses[responseName]) {
+        visitedResponses.add(responseName);
+        processResponse(responses[responseName]);
+      }
+      return;
+    }
+
+    if (response.content) {
+      Object.values(response.content).forEach((content) => {
+        if (content?.schema) {
+          processSchemaRefs(content.schema);
+        }
+      });
+    }
+  };
+
+  const visitedRequestBodies = new Set();
+  const processRequestBody = (requestBody) => {
+    if (!requestBody || typeof requestBody !== 'object') return;
+
+    if (requestBody.$ref) {
+      const requestBodyName = requestBody.$ref.replace('#/components/requestBodies/', '');
+      if (!visitedRequestBodies.has(requestBodyName) && requestBodies[requestBodyName]) {
+        visitedRequestBodies.add(requestBodyName);
+        processRequestBody(requestBodies[requestBodyName]);
+      }
+      return;
+    }
+
+    if (requestBody.content) {
+      Object.values(requestBody.content).forEach((content) => {
+        if (content?.schema) {
+          processSchemaRefs(content.schema);
+        }
+      });
+    }
+  };
+
+  const visitedParameters = new Set();
+  const processParameter = (parameter) => {
+    if (!parameter || typeof parameter !== 'object') return;
+
+    if (parameter.$ref) {
+      const parameterName = parameter.$ref.replace('#/components/parameters/', '');
+      if (!visitedParameters.has(parameterName) && parameters[parameterName]) {
+        visitedParameters.add(parameterName);
+        processParameter(parameters[parameterName]);
+      }
+      return;
+    }
+
+    if (parameter.schema) {
+      processSchemaRefs(parameter.schema);
+    }
+
+    if (parameter.content) {
+      Object.values(parameter.content).forEach((content) => {
+        if (content?.schema) {
+          processSchemaRefs(content.schema);
+        }
+      });
+    }
+  };
+
+  Object.values(paths).forEach((pathItem) => {
+    if (!pathItem || typeof pathItem !== 'object') return;
+
+    Object.entries(pathItem).forEach(([key, operation]) => {
+      if (key === 'parameters' && Array.isArray(operation)) {
+        operation.forEach((param) => processParameter(param));
+        return;
+      }
+
       if (typeof operation !== 'object') return;
 
-      if (operation.requestBody?.content) {
-        Object.values(operation.requestBody.content).forEach((content) => {
-          if (content.schema?.$ref) {
-            const schemaName = content.schema.$ref.replace('#/components/schemas/', '');
-            schemasToProcess.push(schemaName);
-          }
-          if (content.schema?.properties?.requests?.items?.$ref) {
-            const schemaName = content.schema.properties.requests.items.$ref.replace(
-              '#/components/schemas/',
-              ''
-            );
-            schemasToProcess.push(schemaName);
-          }
-        });
+      if (operation.requestBody) {
+        processRequestBody(operation.requestBody);
       }
 
       if (operation.responses) {
-        Object.entries(operation.responses).forEach(([, response]) => {
-          if (response.$ref) {
-            const responseName = response.$ref.replace('#/components/responses/', '');
-            const responseDefinition = responses[responseName];
-            if (responseDefinition?.content) {
-              Object.values(responseDefinition.content).forEach((content) => {
-                if (content.schema?.$ref) {
-                  const schemaName = content.schema.$ref.replace('#/components/schemas/', '');
-                  schemasToProcess.push(schemaName);
-                }
-              });
-            }
-          }
-
-          if (response.content) {
-            Object.values(response.content).forEach((content) => {
-              if (content.schema?.$ref) {
-                const schemaName = content.schema.$ref.replace('#/components/schemas/', '');
-                schemasToProcess.push(schemaName);
-              }
-              if (content.schema?.allOf) {
-                content.schema.allOf.forEach((allOfItem) => {
-                  if (allOfItem.$ref) {
-                    const schemaName = allOfItem.$ref.replace('#/components/schemas/', '');
-                    schemasToProcess.push(schemaName);
-                  }
-                  if (allOfItem.properties?.value?.items?.$ref) {
-                    const schemaName = allOfItem.properties.value.items.$ref.replace(
-                      '#/components/schemas/',
-                      ''
-                    );
-                    schemasToProcess.push(schemaName);
-                  }
-                });
-              }
-            });
-          }
+        Object.values(operation.responses).forEach((response) => {
+          processResponse(response);
         });
       }
 
       if (operation.parameters) {
         operation.parameters.forEach((param) => {
-          if (param.schema?.$ref) {
-            const schemaName = param.schema.$ref.replace('#/components/schemas/', '');
-            schemasToProcess.push(schemaName);
-          }
+          processParameter(param);
         });
       }
     });
